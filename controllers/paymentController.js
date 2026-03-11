@@ -3,6 +3,9 @@ const crypto = require("crypto");
 const supabase = require("../db/supabaseClient");
 
 const PAYSTACK_SECRET = process.env.PAYSTACK_SECRET_KEY;
+const EXPOSE_PAYMENT_ERRORS =
+  process.env.EXPOSE_PAYMENT_ERRORS === "true" ||
+  process.env.NODE_ENV !== "production";
 
 if (!PAYSTACK_SECRET) {
   console.error("❌ PAYSTACK_SECRET_KEY is missing in environment variables");
@@ -17,13 +20,15 @@ exports.initializePayment = async (req, res) => {
   try {
 
     const {
+      user_id,
       customer_name,
       customer_email,
       customer_phone,
       delivery_address,
       delivery_city,
       total_amount,
-      items
+      items,
+      currency
     } = req.body;
 
     if (!customer_email || !total_amount || !Array.isArray(items) || items.length === 0) {
@@ -32,28 +37,71 @@ exports.initializePayment = async (req, res) => {
       });
     }
 
+    const amount = Number(total_amount);
+    if (!Number.isFinite(amount) || amount <= 0) {
+      return res.status(400).json({ message: "Invalid total_amount" });
+    }
+
     const reference = "tajii_" + Date.now();
 
     // INSERT TRANSACTION
-    const { error: txError } = await supabase
+    const txPayload = {
+      user_id: user_id ?? null,
+      paystack_reference: reference,
+      order_reference: reference,
+      amount,
+      currency: currency || "KES",
+      status: "pending",
+      payment_method: "paystack",
+      metadata: {
+        customer_name,
+        customer_email,
+        customer_phone,
+        delivery_address,
+        delivery_city,
+        items,
+        total_amount: amount
+      }
+    };
+
+    let { error: txError } = await supabase
       .from("transactions")
-      .insert([
-        {
-          paystack_reference: reference,
-          order_reference: reference,
-          amount: total_amount,
-          currency: "KES",
-          status: "pending",
-          metadata: {
-            customer_email,
-            items
-          }
-        }
-      ]);
+      .insert([txPayload]);
+
+    // If `metadata` column is `text` (not json/jsonb), retry with a JSON string.
+    if (
+      txError &&
+      (txError.code === "42804" ||
+        (typeof txError.message === "string" &&
+          txError.message.toLowerCase().includes("metadata")))
+    ) {
+      const retryPayload = { ...txPayload, metadata: JSON.stringify(txPayload.metadata) };
+      const retry = await supabase.from("transactions").insert([retryPayload]);
+      txError = retry.error;
+    }
 
     if (txError) {
       console.error("Transaction insert error:", txError);
-      return res.status(500).json({ message: "Failed to create transaction" });
+
+      // Common Postgres error code for NOT NULL violations.
+      if (txError.code === "23502") {
+        return res.status(400).json({
+          message: "Missing required transaction fields",
+          ...(EXPOSE_PAYMENT_ERRORS ? { error: txError.message, details: txError.details } : {})
+        });
+      }
+
+      return res.status(500).json({
+        message: "Failed to create transaction",
+        ...(EXPOSE_PAYMENT_ERRORS
+          ? {
+              error: txError.message,
+              code: txError.code,
+              details: txError.details,
+              hint: txError.hint
+            }
+          : {})
+      });
     }
 
     // INITIALIZE PAYSTACK PAYMENT
@@ -61,7 +109,7 @@ exports.initializePayment = async (req, res) => {
       "https://api.paystack.co/transaction/initialize",
       {
         email: customer_email,
-        amount: total_amount * 100, // Paystack expects kobo
+        amount: amount * 100, // Paystack expects minor units
         reference: reference,
         callback_url: "https://tajii.netlify.app/payment-success",
         metadata: {
@@ -70,7 +118,7 @@ exports.initializePayment = async (req, res) => {
           delivery_address,
           delivery_city,
           items,
-          total_amount
+          total_amount: amount
         }
       },
       {
