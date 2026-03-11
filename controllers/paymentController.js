@@ -46,7 +46,6 @@ exports.initializePayment = async (req, res) => {
 
     // INSERT TRANSACTION
     const txPayload = {
-      user_id: user_id ?? null,
       paystack_reference: reference,
       order_reference: reference,
       amount,
@@ -63,6 +62,11 @@ exports.initializePayment = async (req, res) => {
         total_amount: amount
       }
     };
+
+    // Important: don't send explicit `null` for NOT NULL columns.
+    if (user_id !== undefined && user_id !== null && user_id !== "") {
+      txPayload.user_id = user_id;
+    }
 
     let { error: txError } = await supabase
       .from("transactions")
@@ -85,8 +89,11 @@ exports.initializePayment = async (req, res) => {
 
       // Common Postgres error code for NOT NULL violations.
       if (txError.code === "23502") {
+        const match = typeof txError.message === "string" ? txError.message.match(/column \"([^\"]+)\"/) : null;
+        const missing_field = match ? match[1] : undefined;
         return res.status(400).json({
           message: "Missing required transaction fields",
+          ...(missing_field ? { missing_field } : {}),
           ...(EXPOSE_PAYMENT_ERRORS ? { error: txError.message, details: txError.details } : {})
         });
       }
