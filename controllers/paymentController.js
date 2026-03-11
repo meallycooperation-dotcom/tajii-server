@@ -30,25 +30,23 @@ exports.initializePayment = async (req, res) => {
 
     const reference = "tajii_" + Date.now();
 
-    // Insert pending transaction
-    const { error: txError } = await supabase
+    // INSERT TRANSACTION
+    const { data: txData, error: txError } = await supabase
       .from("transactions")
       .insert({
         paystack_reference: reference,
         amount: total_amount,
-        status: "pending",
-        metadata: {
-          customer_name,
-          customer_email,
-          items
-        }
-      });
+        status: "pending"
+      })
+      .select()
+      .single();
 
     if (txError) {
       console.error("Transaction insert error:", txError);
+      return res.status(500).json({ message: "Failed to create transaction" });
     }
 
-    // Initialize Paystack payment
+    // PAYSTACK INITIALIZE
     const response = await axios.post(
       "https://api.paystack.co/transaction/initialize",
       {
@@ -98,7 +96,6 @@ exports.paystackWebhook = async (req, res) => {
 
   try {
 
-    // Verify Paystack signature
     const hash = crypto
       .createHmac("sha512", PAYSTACK_SECRET)
       .update(JSON.stringify(req.body))
@@ -115,7 +112,7 @@ exports.paystackWebhook = async (req, res) => {
       const data = event.data;
       const reference = data.reference;
 
-      // Verify payment with Paystack
+      // VERIFY PAYMENT
       const verify = await axios.get(
         `https://api.paystack.co/transaction/verify/${reference}`,
         {
@@ -144,43 +141,68 @@ exports.paystackWebhook = async (req, res) => {
 
       const email = paymentData.customer.email;
 
-      // Prevent duplicate orders
+      // CHECK DUPLICATE ORDER
       const { data: existingOrder } = await supabase
         .from("orders")
         .select("id")
         .eq("reference", reference)
-        .single();
+        .maybeSingle();
 
       if (existingOrder) {
         return res.sendStatus(200);
       }
 
-      // Insert order
-      const { error: orderError } = await supabase
+      // INSERT ORDER
+      const { data: orderData, error: orderError } = await supabase
         .from("orders")
         .insert({
           reference: reference,
-          customer_name: customer_name,
+          customer_name,
           customer_email: email,
-          customer_phone: customer_phone,
-          delivery_address: delivery_address,
-          delivery_city: delivery_city,
-          total_amount: total_amount,
-          items: items
-        });
+          customer_phone,
+          delivery_address,
+          delivery_city,
+          total_amount
+        })
+        .select()
+        .single();
 
       if (orderError) {
         console.error("Order insert error:", orderError);
+        return res.sendStatus(500);
       }
 
-      // Update transaction status
-      await supabase
+      const orderId = orderData.id;
+
+      // INSERT ORDER ITEMS
+      const orderItems = items.map(item => ({
+        order_id: orderId,
+        product_id: item.product_id,
+        product_name: item.product_name,
+        price: item.price,
+        quantity: item.quantity
+      }));
+
+      const { error: itemsError } = await supabase
+        .from("order_items")
+        .insert(orderItems);
+
+      if (itemsError) {
+        console.error("Order items insert error:", itemsError);
+      }
+
+      // UPDATE TRANSACTION STATUS
+      const { error: txUpdateError } = await supabase
         .from("transactions")
         .update({
           status: "success",
           payment_method: paymentData.channel
         })
         .eq("paystack_reference", reference);
+
+      if (txUpdateError) {
+        console.error("Transaction update error:", txUpdateError);
+      }
 
     }
 
